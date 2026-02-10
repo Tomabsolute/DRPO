@@ -17,13 +17,12 @@ from parameterized import parameterized
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
-    AutoModelForVision2Seq,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
     is_vision_available,
 )
-from transformers.testing_utils import require_peft, require_torch_gpu_if_bnb_not_multi_backend_enabled, require_vision
+# from transformers.testing_utils import require_peft, require_torch_gpu_if_bnb_not_multi_backend_enabled, require_vision
 
 from trl import (
     ModelConfig,
@@ -33,31 +32,35 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+# from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
-from .trainer.drpo_utils import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
-from .trainer import DRPOConfig, DRPOTrainer
+from trainer import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
+from trainer import DRPOConfig, DRPOTrainer
 
-DATASETNAME = "substitute for the dataset name"
-MODELNAME = "substitute for the ref and initial policy model name"
+DATASETNAME = "Kyleyee/tldr_test_tiny_data_drpo"
+MODELNAME = "Qwen/Qwen2.5-0.5B-Instruct"
+raw_dataset_id = DATASETNAME
 
 def main(script_args, training_args, model_args):
     ################
     # Model & Tokenizer
     ###################
     torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+        getattr(model_args, "torch_dtype", None) if getattr(model_args, "torch_dtype", None) in ["auto", None, None] else getattr(torch, getattr(model_args, "torch_dtype"))
     )
     quantization_config = get_quantization_config(model_args)
+
+    device_map = {"": local_rank} if quantization_config is not None else None
 
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
-        device_map=get_kbit_device_map() if quantization_config is not None else None,
+        device_map=device_map,
         quantization_config=quantization_config,
     )
+
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
@@ -83,17 +86,24 @@ def main(script_args, training_args, model_args):
     # Then create your preference pipeline
     if training_args.is_bt_model:
         if isinstance(training_args.preference_model_id, dict):
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            device = torch.device(f"cuda:{local_rank}")
             preference_pipeline = estDPOStylePipeline(training_args.preference_model_id)
         else: 
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            device = torch.device(f"cuda:{local_rank}")
             preference_pipeline = BTRewardNetwork(training_args.preference_model_id, pad_token_id=tokenizer.pad_token_id)
     else:
         print("\033[33m++++++++++++++++++ using GPM ++++++++++++++++++\033[0m")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device = torch.device(f"cuda:{local_rank}")
         preference_pipeline = GPMwithRewardNetwork(training_args.preference_model_id)
 
     ################
     # Dataset
     ################
     raw_dataset = load_dataset(raw_dataset_id, "default")
+    raw_dataset = raw_dataset.rename_columns({"a_1": "a1", "a_2": "a2"})
     dataset = transform_dataset(raw_dataset)
 
     print(f"\033[32mLoaded dataset sample:\033[0m {dataset['train'][0]}")
@@ -157,7 +167,8 @@ model_args = ModelConfig(
         model_name_or_path = MODELNAME,
 )
 
-with open(".examples/tldr/config.yaml", "r") as f:
+# training_args接受config.yaml传参
+with open("examples/tldr/config.yaml", "r") as f:
     training_args_config = yaml.safe_load(f)
 
 training_args = DRPOConfig(
@@ -165,6 +176,9 @@ training_args = DRPOConfig(
 )
 
 if __name__ == "__main__":
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     main(script_args, training_args, model_args)
 
 

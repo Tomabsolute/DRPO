@@ -1,18 +1,18 @@
 output_dir: ./output/tldr/
 
-gradient_checkpointing: false
+gradient_checkpointing: true
 model_and_preference_share_basemodel: true
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 5
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 20
 learning_rate: 5.0e-7
-max_length: 1024
+max_length: 768
 generate_temperature: 0.88
 forward_temperature: 0.88
 beta: 0.04
 bf16: true
 dataset_num_proc: 1
-num_astar: 3
-torch_empty_cache_steps: 1
+num_astar: 1
+torch_empty_cache_steps: 50
 num_train_epochs: 1
 eval_steps: 500
 eval_strategy: "no"
@@ -20,10 +20,10 @@ save_strategy: "steps"
 save_steps: 1000
 logging_steps: 50
 push_to_hub: false
-hub_model_id: yourname/yourmodel
-  - wandb
+# hub_model_id: yourname/yourmodel
+#   - wandb
 is_bt_model: false
-preference_model_id: your_preference_model_hub_id_or_path
+preference_model_id: Qwen/Qwen2.5-0.5B-Instruct
 preference_model_kwargs:
   indifferent: false
   random: false

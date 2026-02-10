@@ -11,7 +11,7 @@ from packaging import version
 
 import transformers
 import torch.utils.data
-
+ 
 from datasets import Dataset
 from dataclasses import dataclass
 
@@ -43,21 +43,56 @@ from trl.models import create_reference_model
 from trl.models.utils import unwrap_model_for_generation
 
 from trl.trainer.utils import (
-    SIMPLE_CHAT_TEMPLATE,
-    DPODataCollatorWithPadding,
+    # SIMPLE_CHAT_TEMPLATE,
+    # DPODataCollatorWithPadding,
     disable_dropout_in_model,
     empty_cache,
     generate_model_card,
     get_comet_experiment_url,
-    truncate_right,
     prepare_deepspeed,
     pad,
-    truncate_right,
     selective_log_softmax
 )
 
 from .drpo_utils import get_preference_score, get_preference_score_without_decoding
 from .drpo_config import DRPOConfig
+
+# 对 batch 中每个序列做“右截断”：找到第一个 EOS，保留到 EOS（含）为止，后面全部用 PAD 填充；同时生成 attention mask。
+def truncate_right(input_ids: torch.Tensor, eos_token_id: int, pad_token_id: int):
+    """
+    Right-truncate each sequence at the first eos_token_id (inclusive), and pad the rest with pad_token_id.
+    Returns:
+        truncated_ids: (B, T)
+        attention_mask: (B, T) where tokens up to eos (inclusive) are 1, padded are 0.
+    """
+    # input_ids: (B, T)
+    if input_ids.dim() != 2:
+        raise ValueError(f"input_ids must be 2D (B,T), got {tuple(input_ids.shape)}")
+
+    B, T = input_ids.shape
+    device = input_ids.device
+
+    # positions 0..T-1
+    positions = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+
+    eos_mask = (input_ids == eos_token_id)
+
+    # index of first eos; if no eos -> T (meaning keep all tokens)
+    # trick: set non-eos positions to large number, take min
+    first_eos = torch.where(eos_mask, positions, torch.full_like(positions, T)).min(dim=1).values  # (B,)
+
+    # keep_len = first_eos+1 if eos found else T
+    has_eos = eos_mask.any(dim=1)
+    keep_len = torch.where(has_eos, first_eos + 1, torch.full_like(first_eos, T))  # (B,)
+
+    # build attention mask: positions < keep_len
+    attn = (positions < keep_len.unsqueeze(1)).to(dtype=torch.long)
+
+    # pad out-of-mask tokens
+    out = input_ids.clone()
+    out[attn == 0] = pad_token_id
+    return out, attn
+
 
 
 # if is_peft_available():
@@ -73,6 +108,7 @@ class DataCollatorDRPO(DataCollatorMixin):
     pad_token_id: int
     return_tensors: str = 'pt'
 
+    # 把 dataset 的“变长 list[int]”字段，pad 成一个 batch tensor，并生成对应 mask。
     def torch_call(self, examples: list[Union[list[int], dict[str,Any], Any]])-> dict[str, Any]:
         prompt_ids = [torch.tensor(example["prompt_ids"]) for example in examples]
         prompt_attention_mask = [torch.ones_like(id) for id in prompt_ids]
@@ -93,6 +129,7 @@ class DataCollatorDRPO(DataCollatorMixin):
 
         return output
     
+# 判断样本是否是对话格式（list of messages，每条 message 有 role 和 content）。
 def is_conversational(example: dict[str, Any]) -> bool:
     r"""
     Check if the example is in a conversational format.
@@ -132,7 +169,8 @@ def is_conversational(example: dict[str, Any]) -> bool:
                 return True
 
     return False
-            
+
+# 如果样本是对话格式，调用 apply_chat_template 把 messages 渲染成纯文本 prompt/answers；否则原样返回。
 def maybe_apply_chat_template(
     example: dict[str, list[dict[str, str]]],
     tokenizer: PreTrainedTokenizerBase,
@@ -190,6 +228,7 @@ def maybe_apply_chat_template(
     else:
         return example
     
+# 将对话转换为字符串
 def apply_chat_template(
     example: dict[str, list[dict[str, str]]],
     tokenizer: PreTrainedTokenizerBase,
@@ -415,7 +454,7 @@ class DRPOTrainer(Trainer):
             self.stats["ps/a*"] = []
             self.stats["objective/loss2"] = []
 
-
+    # 返回当前 step/epoch 对应的 beta。
     @property
     def beta(self):
         if isinstance(self._beta, list):
@@ -424,6 +463,7 @@ class DRPOTrainer(Trainer):
         else:
             return self._beta
 
+    # 把一条样本的 prompt/a1/a2 文本转成 token ids，并做 truncation + eos 等处理。
     @staticmethod
     def tokenize_row(feature, 
                      processing_class: PreTrainedTokenizerBase, 
@@ -464,6 +504,7 @@ class DRPOTrainer(Trainer):
             "a2_ids": a2_ids
         }
     
+    # 对 dataset 做一整套预处理 pipeline
     def _prepare_dataset(self, dataset: Union[Dataset, IterableDataset], processing_class: Union[PreTrainedTokenizerBase],
                          args: DRPOConfig, dataset_name: str,) -> Union[Dataset, IterableDataset]:
         map_kwargs = {"writer_batch_size": 10}
@@ -503,7 +544,7 @@ class DRPOTrainer(Trainer):
 
         return dataset
     
-    
+    # 覆盖 Trainer 默认的“模型签名列”推断逻辑，强制 Trainer 不去删你需要的列。
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
@@ -520,7 +561,7 @@ class DRPOTrainer(Trainer):
                 "rank",
             ]
 
-    
+    # 构造训练 DataLoader，并交给 accelerator.prepare。
     @wraps(Trainer.get_train_dataloader)
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
@@ -545,7 +586,7 @@ class DRPOTrainer(Trainer):
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
     
-
+    # 构造 eval DataLoader，支持缓存 persistent workers 的 dataloader，最后 accelerator.prepare。
     @wraps(Trainer.get_eval_dataloader)
     def get_eval_dataloader(self, eval_dataset: Optional[Union[str, Dataset]] = None) -> DataLoader:
         if eval_dataset is None and self.eval_dataset is None:
@@ -594,6 +635,7 @@ class DRPOTrainer(Trainer):
 
         return self.accelerator.prepare(eval_dataloader)
     
+    # 用当前 policy model 从 prompt 生成 num_astar 条样本y^*
     def _generate(self, model, prompt_ids: torch.tensor, prompt_attention_mask: torch.tensor, num_astar:int = 1):
         eos_token_id = self.processing_class.eos_token_id
         pad_token_id = self.processing_class.pad_token_id
@@ -613,6 +655,7 @@ class DRPOTrainer(Trainer):
 
         return prompt_ids, prompt_attention_mask, completion_ids, completion_attention_mask
     
+    # 计算给定 completion 的 per-token log-prob（只对 completion token 取 logp）。
     def _forward(self, model, prompt_ids, prompt_attention_mask, completion_ids, completion_attention_mask, temperature=1.0):
         # Get the number of tokens to truncate from prompt
         num_tokens_to_truncate = max(prompt_ids.size(1) + completion_ids.size(1) - self.max_length, 0)
@@ -636,6 +679,7 @@ class DRPOTrainer(Trainer):
         # logps = torch.take_along_dim(logits.log_softmax(dim=-1), completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
         return logps
     
+    # DRPO 的核心训练逻辑：计算 loss、记录 stats、backward。
     def training_step(self, model:nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int]=None) -> torch.Tensor:
         model.train()
         args = self.args
@@ -858,7 +902,7 @@ class DRPOTrainer(Trainer):
             if self.args.ratio_processing == "clip":
                 self.stats['clipped_ratio'].append(self.accelerator.gather_for_metrics(clipped_ratio).mean().item())
         if not self.args.loss1_only:
-            self.stats['objective/loss2'].append(self.accelerator.gather_for_metrics(loss2).item())
+            self.stats['objective/loss2'].append(self.accelerator.gather_for_metrics(loss2).mean().item())
             self.stats['logps/a*'].append(self.accelerator.gather_for_metrics(logps_star).mean().item())
             self.stats['logps/a*_ref'].append(self.accelerator.gather_for_metrics(per_token_ref_logps_star*astar_attention_mask).sum(-1).mean().item())
             self.stats['ps/a*'].append(self.accelerator.gather_for_metrics(preference_score_star).mean().item()) # preference score
@@ -887,6 +931,7 @@ class DRPOTrainer(Trainer):
 
         return loss.detach()
     
+    # 重写 Trainer 的“到点就 log / evaluate / save”逻辑
     def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time=None, learning_rate=None):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             logs: dict[str, float] = {}
@@ -928,6 +973,7 @@ class DRPOTrainer(Trainer):
             self._save_checkpoint(model, trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
+    # 从评估 metrics 中判断是否出现“新的最好”，用于 best-save。
     # Copy-pasted from transformers.Trainer to maintain compatibility with earlier versions.
     # This can be removed once the minimum transformers version is updated to 4.47.
     def _determine_best_metric(self, metrics, trial):
@@ -969,6 +1015,7 @@ class DRPOTrainer(Trainer):
 
         return is_new_best_metric
     
+    # 训练完生成 README/model card（hub 用）
     def create_model_card(
         self,
         model_name: Optional[str] = None,

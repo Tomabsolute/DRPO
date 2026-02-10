@@ -121,10 +121,14 @@ def get_reward_model(base_causal_model, base_llm_model, value_head_dim: int, add
 class GPMwithRewardNetwork(nn.Module):
     def __init__(self, 
                  model_name_or_path: str, 
-                 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), 
+                 device: Optional[torch.device] = None, 
                  pad_token_id: Optional[int]=None,
                  is_general_preference: bool=True,
                  bf16: bool=True):
+        if device is None:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
         super().__init__()
         self.device = device
 
@@ -147,25 +151,36 @@ class GPMwithRewardNetwork(nn.Module):
             self.value_head_dim = combined_weights["value_head.weight"].shape[0]
         self.add_prompt_head = True if "prompt_head.weight" in combined_weights else False 
 
+        self.add_prompt_head = getattr(self, "add_prompt_head", False)
+        self.value_head_dim = getattr(self, "value_head_dim", 1)
+
         cls_class = get_reward_model(base_causal_class, base_class, add_prompt_head=self.add_prompt_head, value_head_dim=self.value_head_dim, is_general_preference=is_general_preference)
         self.model = cls_class.from_pretrained(
             model_name_or_path,
             config=config,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if bf16 else "auto",
-            device_map="auto",
-            attn_implementation="eager"
+            device_map=None,                 # 关键：禁止跨卡切分
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
         )
+        self.model.to(self.device)           # 关键：放到本进程卡
+        self.model.eval()
+
 
         if pad_token_id is not None:
-            self.rm.config.pad_token_id = pad_token_id
+            self.model.config.pad_token_id = pad_token_id
+
     
     def forward(self, input_ids, attention_mask, return_output=False):
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        attention_mask = attention_mask.to(self.device, non_blocking=True)
         input_ids[:, -1] = self.model.config.eos_token_id
         attention_mask[:, -1] = 1
         with torch.no_grad():
             rewards, _ = self.model.custom_forward(input_ids, attention_mask, return_output)
         return rewards
+
 
 
 class GPMPipeline:
@@ -199,6 +214,8 @@ class GPMPipeline:
 
 
         self.add_prompt_head = True if "prompt_head.weight" in combined_weights else False
+        self.add_prompt_head = getattr(self, "add_prompt_head", False)
+        self.value_head_dim = getattr(self, "value_head_dim", 1)
 
         cls_class = get_reward_model(base_causal_class, base_class, add_prompt_head=self.add_prompt_head, value_head_dim=self.value_head_dim, is_general_preference=is_general_preference)
 
@@ -208,9 +225,13 @@ class GPMPipeline:
             config=config,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if bf16 else "auto",
-            device_map="auto",
-            attn_implementation="eager"
+            device_map=None,                 # 禁止 auto
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
         )
+        self.model.to(device)
+        self.model.eval()
+
         
         # configure tokenizer
         self.tokenizer = get_tokenizer(model_name_or_path, self.model, "left", use_fast=True)
@@ -414,22 +435,35 @@ def get_preference_score_without_decoding(preference_model, a1_iuput_ids, a1_att
     if is_bt_model:
         result = a1_reward - a2_reward
     else:
-        if preference_model.value_head_dim == 2:
+        dim = getattr(preference_model, "value_head_dim", None)
+
+        # === 关键补丁：标量 reward 直接做差 ===
+        if dim is None or dim == 1:
+            result = (a1_reward - a2_reward).view(-1)
+
+        elif dim == 2:
             result = a1_reward[:, 0] * a2_reward[:, 1] - a1_reward[:, 1] * a2_reward[:, 0]
+
         else:
-            R_matrix = torch.zeros((preference_model.value_head_dim, preference_model.value_head_dim), device=a1_reward.device, dtype=a1_reward.dtype)
-            for i in range(0, preference_model.value_head_dim, 2):
-                R_matrix[i, i+1] = -1 
-                R_matrix[i+1, i] = 1   
-            if a1_reward.device == a2_reward.device == R_matrix.device:
-                transformed_a_1 = torch.matmul(a1_reward, R_matrix.T)
-                result = torch.bmm(transformed_a_1.view(a1_reward.shape[0], 1, preference_model.value_head_dim), a2_reward.view(a2_reward.shape[0], preference_model.value_head_dim, 1))
-                result = result.view(a1_reward.shape[0])  
-    p = F.sigmoid(result)
+            # 反对称矩阵方法要求 dim 为偶数
+            if dim % 2 != 0:
+                raise ValueError(f"value_head_dim must be even for R-matrix method, got {dim}")
+
+            R_matrix = torch.zeros((dim, dim), device=a1_reward.device, dtype=a1_reward.dtype)
+            for i in range(0, dim, 2):
+                R_matrix[i, i+1] = -1
+                R_matrix[i+1, i] = 1
+
+            transformed_a1 = torch.matmul(a1_reward, R_matrix.T)
+            result = torch.bmm(
+                transformed_a1.view(a1_reward.shape[0], 1, dim),
+                a2_reward.view(a2_reward.shape[0], dim, 1),
+            ).view(a1_reward.shape[0])
+
+    p = torch.sigmoid(result)
     if kwargs.get("reverse", False):
         p = 1 - p
     return p
-
 
 
 class BTRewardNetwork(nn.Module):
