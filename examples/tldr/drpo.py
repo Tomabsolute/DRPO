@@ -37,8 +37,8 @@ from trl import (
 from trainer import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
 from trainer import DRPOConfig, DRPOTrainer
 
-DATASETNAME = "Kyleyee/tldr_test_tiny_data_drpo"
-MODELNAME = "Qwen/Qwen2.5-0.5B-Instruct"
+DATASETNAME = "Kyleyee/train_data_tldr"
+MODELNAME = "cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr"
 raw_dataset_id = DATASETNAME
 
 def main(script_args, training_args, model_args):

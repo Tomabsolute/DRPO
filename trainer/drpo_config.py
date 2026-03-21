@@ -176,14 +176,15 @@ class DRPOConfig(TrainingArguments):
     # 处理重要性采样的方法
     ratio_processing: Union[str, None] = field(
         default=None,
-        metadata={"help": "Processing method for the Importance Sampling ratio. if clip, you need better to provide the clipbound. "
-        "Options include `clip`, `self_normalize`, `None`. Default to None."},
+        metadata={"help": "Processing method for the IS estimator. "
+        "`clip` uses Clip-DRPO style correction clipping (Eq. 4.3), "
+        "`self_normalize` uses self-normalized ratio, and `None` uses raw ratio."},
     )
 
     # 重要性采样比的上限
     clipbound: Optional[float] = field(
         default=10.0,
-        metadata={"help": "Clip upper bound for the Importance Sampling ratio, default to 10.0."},
+        metadata={"help": "Deprecated by Clip-DRPO correction clipping; kept for backward compatibility."},
     )
 
     # 控制参考模型前向传递的温度
@@ -215,5 +216,4 @@ class DRPOConfig(TrainingArguments):
         super().__post_init__()
         if hasattr(self.beta, "__len__") and len(self.beta) == 1:
             self.beta = self.beta[0]
-
 

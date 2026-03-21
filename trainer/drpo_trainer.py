@@ -446,8 +446,7 @@ class DRPOTrainer(Trainer):
             self.stats["ps/a1"] = []
             self.stats["is_ratio"] = []
             if args.ratio_processing == "clip":
-            # self.stats["objective/loss1_clipped"] = []
-                self.stats["clipped_ratio"] = []
+                self.stats["clipped_correction"] = []
         if not args.loss1_only:
             self.stats["logps/a*"] = []
             self.stats["logps/a*_ref"] = []
@@ -678,6 +677,13 @@ class DRPOTrainer(Trainer):
         logps = selective_log_softmax(logits, completion_ids)
         # logps = torch.take_along_dim(logits.log_softmax(dim=-1), completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
         return logps
+
+    # Clip x into [min(a, b), max(a, b)], matching clip function in Clip-DRPO (Eq. 4.3).
+    @staticmethod
+    def _clip_between(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        lower = torch.minimum(a, b)
+        upper = torch.maximum(a, b)
+        return torch.clamp(x, min=lower, max=upper)
     
     # DRPO 的核心训练逻辑：计算 loss、记录 stats、backward。
     def training_step(self, model:nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int]=None) -> torch.Tensor:
@@ -762,15 +768,25 @@ class DRPOTrainer(Trainer):
                 ref_logps = (per_token_ref_logps * a1_attention_mask).sum(1)
 
                 ratio = torch.exp(logps - ref_logps)
-                clipped_ratio = torch.clamp(ratio, min = 1. / self.args.clipbound, max = self.args.clipbound)
-                losses1 = - clipped_ratio.detach() * (rank - preference_score.clone()).detach() * logps
+                is_term = -ratio.detach() * rank.detach() * logps
+                correction_term = -ratio.detach() * preference_score.clone().detach() * logps
+                losses1 = is_term - correction_term
+
+                if args.ratio_processing == "clip" and (not args.loss1_only):
+                    is_value = is_term.mean()
+                    correction_value = correction_term.mean()
+                    dm_value = loss2.detach()
+                    clipped_correction = self._clip_between(correction_value, is_value.detach(), dm_value)
+                    loss1_value = is_value - clipped_correction
+                else:
+                    loss1_value = losses1.mean()
 
             if args.loss1_only:
-                loss = losses1.mean() + self.beta * mean_kl
+                loss = loss1_value + self.beta * mean_kl
             elif args.loss2_only:
                 loss = loss2 + self.beta * mean_kl
             else:
-                loss = losses1.mean() + loss2 + self.beta * mean_kl
+                loss = loss1_value + loss2 + self.beta * mean_kl
 
         else:
             batch_size = inputs["prompt_ids"].size(0)
@@ -865,47 +881,61 @@ class DRPOTrainer(Trainer):
             logps = (per_token_logps * a1_attention_mask).sum(1)
             ref_logps = (per_token_ref_logps * a1_attention_mask).sum(1)
             
-            if args.ratio_processing == "clip":
-                ratio = torch.exp(logps - ref_logps)
-
-                clipped_ratio = torch.clamp(ratio, min = 1. / self.args.clipbound, max = self.args.clipbound)
-                losses1 =  - clipped_ratio.detach() * (rank - preference_score.clone()).detach() * logps
-
-            elif args.ratio_processing == "self_normalize":
+            if args.ratio_processing == "self_normalize":
                 ratio_nominator = torch.exp(logps) / torch.exp(logps).mean()
                 ratio_denominator = torch.exp(ref_logps) / torch.exp(ref_logps).mean()
                 ratio = ratio_nominator / ratio_denominator
-                losses1 = - ratio.detach() * (rank - preference_score.clone()).detach() * logps
 
             else:
                 ratio = torch.exp(logps - ref_logps)
-                losses1 = -ratio.detach() * (rank - preference_score.clone()).detach() * logps
+
+            is_term = -ratio.detach() * rank.detach() * logps
+            correction_term = -ratio.detach() * preference_score.clone().detach() * logps
+            losses1 = is_term - correction_term
+
+            if args.ratio_processing == "clip" and (not args.loss1_only):
+                is_value = is_term.mean()
+                correction_value = correction_term.mean()
+                dm_value = loss2.detach()
+                clipped_correction = self._clip_between(correction_value, is_value.detach(), dm_value)
+                loss1_value = is_value - clipped_correction
+            else:
+                loss1_value = losses1.mean()
             
             if args.loss2_only:
                 loss = loss2 + self.beta * mean_kl
             elif args.loss1_only:
-                losses1 = -clipped_ratio.detach() * rank.detach() * logps
-                loss = losses1.mean() + self.beta * mean_kl
+                loss = loss1_value + self.beta * mean_kl
             else:
-                loss = losses1.mean() + loss2 + self.beta * mean_kl
+                loss = loss1_value + loss2 + self.beta * mean_kl
             
 
         # log everything
         self.stats['beta'].append(self.beta)
         self.stats['objective/kl'].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
         if not self.args.loss2_only:
-            self.stats['objective/loss1'].append(self.accelerator.gather_for_metrics(losses1).mean().item())
+            self.stats['objective/loss1'].append(self.accelerator.gather_for_metrics(loss1_value).mean().item())
             self.stats["logps/a1"].append(self.accelerator.gather_for_metrics(logps).mean().item())
             self.stats['logps/a1_ref'].append(self.accelerator.gather_for_metrics(ref_logps).mean().item())
             self.stats['ps/a1'].append(self.accelerator.gather_for_metrics(preference_score).mean().item()) # preference score
             self.stats['is_ratio'].append(self.accelerator.gather_for_metrics(ratio.mean()).mean().item())
-            if self.args.ratio_processing == "clip":
-                self.stats['clipped_ratio'].append(self.accelerator.gather_for_metrics(clipped_ratio).mean().item())
+            if self.args.ratio_processing == "clip" and (not self.args.loss1_only):
+                self.stats['clipped_correction'].append(self.accelerator.gather_for_metrics(clipped_correction).mean().item())
         if not self.args.loss1_only:
-            self.stats['objective/loss2'].append(self.accelerator.gather_for_metrics(loss2).mean().item())
-            self.stats['logps/a*'].append(self.accelerator.gather_for_metrics(logps_star).mean().item())
-            self.stats['logps/a*_ref'].append(self.accelerator.gather_for_metrics(per_token_ref_logps_star*astar_attention_mask).sum(-1).mean().item())
-            self.stats['ps/a*'].append(self.accelerator.gather_for_metrics(preference_score_star).mean().item()) # preference score
+            self.stats['objective/loss2'].append(
+                self.accelerator.gather_for_metrics(loss2).mean().item()
+            )
+            self.stats['logps/a*'].append(
+                self.accelerator.gather_for_metrics(logps_star).mean().item()
+            )
+
+            local_logps_astar_ref = (per_token_ref_logps_star * astar_attention_mask).sum(-1).mean()
+            gathered_logps_astar_ref = self.accelerator.gather_for_metrics(local_logps_astar_ref.unsqueeze(0))
+            self.stats['logps/a*_ref'].append(gathered_logps_astar_ref.mean().item())
+
+            self.stats['ps/a*'].append(
+                self.accelerator.gather_for_metrics(preference_score_star).mean().item()
+            )
         self.stats['objective/loss'].append(self.accelerator.gather_for_metrics(loss).mean().item())
         self.stats['rank'].append(self.accelerator.gather_for_metrics(rank).mean().item())
 
