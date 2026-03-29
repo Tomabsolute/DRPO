@@ -72,3 +72,5 @@ python compare_hh_outputs.py \
   --num_samples 50 \
   --output_file results/compare_hh_outputs.jsonl
 ```
+
+`accelerate launch -m examples.general.drpo --config examples/general/config.yaml`

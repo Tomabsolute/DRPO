@@ -473,6 +473,9 @@ class BTRewardNetwork(nn.Module):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), 
     pad_token_id: Optional[int]=None, 
     eos_token_id: Optional[int]=151645,
+    truncation: bool = True,
+    padding: bool = True,
+    max_length: int = 4096,
     ):
         super().__init__()
         self.rm = AutoModelForSequenceClassification.from_pretrained(
@@ -483,17 +486,52 @@ class BTRewardNetwork(nn.Module):
             # attn_implementation="flash_attention_2",
             num_labels=1,
         )
+        self.rm_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        if self.rm_tokenizer.pad_token is None:
+            self.rm_tokenizer.pad_token = self.rm_tokenizer.eos_token
+            self.rm_tokenizer.pad_token_id = self.rm_tokenizer.eos_token_id
+        self.rm.config.pad_token_id = self.rm_tokenizer.pad_token_id
+        self.truncation = truncation
+        self.padding = padding
+        self.max_length = max_length
         if pad_token_id is not None:
             self.rm.config.pad_token_id = pad_token_id
         self.to(device)
 
-    def forward(self, input_ids, attention_mask):
+    def _score_tokenized(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        if input_ids.numel() > 0 and int(input_ids.max().item()) >= int(self.rm.config.vocab_size):
+            raise ValueError(
+                "Detected token IDs out of reward model vocab range. "
+                "Set `model_and_preference_share_basemodel: false` when policy and reward models "
+                "use different tokenizers."
+            )
         with torch.no_grad():
             outputs = self.rm(input_ids=input_ids, attention_mask=attention_mask)
             scores = outputs.logits.squeeze()
             if scores.ndim == 0:
                 scores = scores.unsqueeze(0)
             return scores
+
+    def _score_text(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        tokenized = self.rm_tokenizer(
+            texts,
+            padding=self.padding,
+            truncation=self.truncation,
+            max_length=self.max_length,
+            return_tensors="pt",
+            add_special_tokens=True,
+            return_attention_mask=True,
+        )
+        tokenized = {k: v.to(self.device, non_blocking=True) for k, v in tokenized.items()}
+        return self._score_tokenized(tokenized["input_ids"], tokenized["attention_mask"])
+
+    def forward(self, input_ids, attention_mask=None):
+        # Support both token-ids mode (shared tokenizer) and raw-text mode (decoupled tokenizer).
+        if attention_mask is None and (isinstance(input_ids, str) or isinstance(input_ids, list)):
+            return self._score_text(input_ids)
+        return self._score_tokenized(input_ids, attention_mask)
         
     def to(self, device):
         self.device = device
