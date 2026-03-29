@@ -18,7 +18,7 @@ from trainer_2 import DRPOConfig, DRPOTrainer
 
 
 DATASETNAME = "Kyleyee/train_data_hh_for_drpo"
-MODELNAME = "Kyleyee/Qwen2.5-1.5B-sft-hh"
+MODELNAME = "Kyleyee/Qwen2.5-7B-sft-hh"
 
 
 def transform_dataset(dataset, seed=996):

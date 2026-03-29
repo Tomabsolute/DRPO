@@ -38,7 +38,7 @@ from trainer_2 import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
 from trainer_2 import DRPOConfig, DRPOTrainer
 
 DATASETNAME = "Kyleyee/train_data_tldr"
-MODELNAME = "cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr"
+MODELNAME = "cleanrl/EleutherAI_pythia-6.9b-deduped__sft__tldr"
 raw_dataset_id = DATASETNAME
 
 def main(script_args, training_args, model_args):

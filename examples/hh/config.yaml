@@ -37,7 +37,7 @@ push_to_hub: false
 
 is_bt_model: true
 
-preference_model_id: Kyleyee/Qwen2.5-1.5B-Reward_hh
+preference_model_id: Kyleyee/Qwen2.5-7B-reward-hh
 preference_model_revision: main  
 
 preference_model_kwargs:
