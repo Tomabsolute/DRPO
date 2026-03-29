@@ -13,8 +13,8 @@ from trl import (
 )
 from trl.experimental.utils import SIMPLE_CHAT_TEMPLATE
 
-from trainer.drpo_utils import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
-from trainer import DRPOConfig, DRPOTrainer
+from trainer_2 import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
+from trainer_2 import DRPOConfig, DRPOTrainer
 
 
 DATASETNAME = "Kyleyee/train_data_hh_for_drpo"

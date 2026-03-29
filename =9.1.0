@@ -1,0 +1,15 @@
+Collecting sentencepiece
+  Using cached sentencepiece-0.2.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (10 kB)
+Collecting einops
+  Downloading einops-0.8.2-py3-none-any.whl.metadata (13 kB)
+Collecting scipy
+  Using cached scipy-1.15.3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (61 kB)
+Requirement already satisfied: pyyaml in /home/fjr/.conda/envs/drpo/lib/python3.10/site-packages (6.0.3)
+Requirement already satisfied: Pillow in /home/fjr/.local/lib/python3.10/site-packages (12.1.0)
+Requirement already satisfied: numpy<2.5,>=1.23.5 in /home/fjr/.local/lib/python3.10/site-packages (from scipy) (2.2.6)
+Using cached sentencepiece-0.2.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (1.4 MB)
+Downloading einops-0.8.2-py3-none-any.whl (65 kB)
+Using cached scipy-1.15.3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (37.7 MB)
+Installing collected packages: sentencepiece, scipy, einops
+
+Successfully installed einops-0.8.2 scipy-1.15.3 sentencepiece-0.2.1

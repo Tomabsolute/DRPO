@@ -34,8 +34,8 @@ from trl import (
 )
 # from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
-from trainer import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
-from trainer import DRPOConfig, DRPOTrainer
+from trainer_2 import GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
+from trainer_2 import DRPOConfig, DRPOTrainer
 
 DATASETNAME = "Kyleyee/train_data_tldr"
 MODELNAME = "cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr"
