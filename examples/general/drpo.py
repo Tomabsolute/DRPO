@@ -1,8 +1,9 @@
 import argparse
+from collections import defaultdict
 from typing import Any
 
-import torch
 import yaml
+import torch
 from datasets import Dataset, DatasetDict, concatenate_datasets, interleave_datasets, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import (
@@ -13,6 +14,32 @@ from trl import (
     get_quantization_config,
 )
 from trl.experimental.utils import SIMPLE_CHAT_TEMPLATE
+
+
+def _messages_to_text(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return str(messages)
+    chunks = []
+    for m in messages:
+        if isinstance(m, dict):
+            role = str(m.get("role", "unknown"))
+            content = str(m.get("content", ""))
+            chunks.append(f"{role}: {content}")
+        else:
+            chunks.append(str(m))
+    return "\n".join(chunks).strip()
+
+
+def _to_plain_text(x: Any) -> str:
+    if isinstance(x, str):
+        return x
+    if isinstance(x, list):
+        return _messages_to_text(x)
+    if isinstance(x, dict):
+        role = str(x.get("role", "unknown"))
+        content = str(x.get("content", ""))
+        return f"{role}: {content}".strip()
+    return str(x)
 
 
 def load_drpo_modules(trainer_variant: str):
@@ -28,39 +55,106 @@ def load_drpo_modules(trainer_variant: str):
 
 def convert_example_to_drpo_schema(example: dict[str, Any]) -> dict[str, Any]:
     keys = set(example.keys())
-    if {"prompt", "a1", "a2", "rank"}.issubset(keys):
+    prompt_key = None
+    for k in ["prompt", "instruction", "input", "question"]:
+        if k in keys:
+            prompt_key = k
+            break
+
+    def _get_prompt():
+        if prompt_key is None:
+            return None
+        return example[prompt_key]
+    if {"a1", "a2", "rank"}.issubset(keys) and prompt_key is not None:
         rank = int(example["rank"])
         if rank not in (0, 1):
             raise ValueError(f"rank must be 0/1, got {example['rank']}")
         return {
-            "prompt": example["prompt"],
+            "prompt": _get_prompt(),
             "a1": example["a1"],
             "a2": example["a2"],
             "rank": rank,
         }
 
-    if {"prompt", "chosen", "rejected"}.issubset(keys):
+    if {"chosen", "rejected"}.issubset(keys) and prompt_key is not None:
+        # UltraFeedback-style conversational records: chosen/rejected are full dialogs
+        # [user, assistant]. Convert to prompt + assistant completion pair.
+        if isinstance(example["chosen"], list) and isinstance(example["rejected"], list):
+            chosen = example["chosen"]
+            rejected = example["rejected"]
+            if len(chosen) >= 2 and len(rejected) >= 2:
+                prompt_msgs = chosen[:-1]
+                a1_msg = chosen[-1:]
+                a2_msg = rejected[-1:]
+                return {
+                    "prompt": prompt_msgs,
+                    "a1": a1_msg,
+                    "a2": a2_msg,
+                    "rank": 1,
+                }
         return {
-            "prompt": example["prompt"],
+            "prompt": _get_prompt(),
             "a1": example["chosen"],
             "a2": example["rejected"],
             "rank": 1,
         }
 
-    if {"prompt", "response_0", "response_1", "chosen"}.issubset(keys):
+    if {"response_1", "response_2", "preference"}.issubset(keys) and prompt_key is not None:
+        pref = int(example["preference"])
+        # HelpSteer2-Preference uses:
+        # negative -> response_1 better; positive -> response_2 better; -100 invalid.
+        if pref == -100 or pref == 0:
+            return {
+                "prompt": _get_prompt(),
+                "a1": example["response_1"],
+                "a2": example["response_2"],
+                "rank": -1,
+            }
+        rank = 1 if pref < 0 else 0
+        return {
+            "prompt": _get_prompt(),
+            "a1": example["response_1"],
+            "a2": example["response_2"],
+            "rank": rank,
+        }
+
+    if {"response_0", "response_1", "chosen"}.issubset(keys) and prompt_key is not None:
         chosen = int(example["chosen"])
         if chosen not in (0, 1):
             raise ValueError(f"chosen must be 0/1, got {example['chosen']}")
         return {
-            "prompt": example["prompt"],
+            "prompt": _get_prompt(),
             "a1": example["response_0"],
             "a2": example["response_1"],
             "rank": 1 if chosen == 0 else 0,
         }
 
+    # Generic pairwise aliases
+    if {"answer_0", "answer_1", "label"}.issubset(keys) and prompt_key is not None:
+        label = int(example["label"])
+        return {
+            "prompt": _get_prompt(),
+            "a1": example["answer_0"],
+            "a2": example["answer_1"],
+            "rank": 1 if label == 0 else 0,
+        }
+
+    if {"response_a", "response_b", "winner"}.issubset(keys) and prompt_key is not None:
+        winner = str(example["winner"]).lower()
+        if winner not in {"a", "b"}:
+            return {"prompt": _get_prompt(), "a1": example["response_a"], "a2": example["response_b"], "rank": -1}
+        return {
+            "prompt": _get_prompt(),
+            "a1": example["response_a"],
+            "a2": example["response_b"],
+            "rank": 1 if winner == "a" else 0,
+        }
+
     raise ValueError(
         "Unsupported dataset schema. Expected one of: "
-        "{prompt,a1,a2,rank}, {prompt,chosen,rejected}, {prompt,response_0,response_1,chosen}."
+        "{prompt/a1/a2/rank}, {prompt/chosen/rejected}, {prompt/response_0/response_1/chosen}, "
+        "{prompt/response_1/response_2/preference}. "
+        f"Got keys={sorted(list(keys))}"
     )
 
 
@@ -88,7 +182,21 @@ def transform_dataset(dataset: DatasetDict, split_names: list[str], augment_swap
 
 def standardize_preference_dataset(ds: Dataset, augment_swap: bool, seed: int) -> Dataset:
     remove_cols = ds.column_names
-    standardized = ds.map(convert_example_to_drpo_schema, remove_columns=remove_cols)
+    def _safe_convert(x: dict[str, Any]) -> dict[str, Any]:
+        try:
+            out = convert_example_to_drpo_schema(x)
+            out["prompt"] = _to_plain_text(out["prompt"])
+            out["a1"] = _to_plain_text(out["a1"])
+            out["a2"] = _to_plain_text(out["a2"])
+            out["_valid"] = 1 if out["rank"] in [0, 1] else 0
+            return out
+        except Exception:
+            return {"prompt": "", "a1": "", "a2": "", "rank": -1, "_valid": 0}
+
+    standardized = ds.map(_safe_convert, remove_columns=remove_cols)
+    standardized = standardized.filter(lambda x: x["_valid"] == 1)
+    standardized = standardized.remove_columns(["_valid"])
+    standardized = standardized.filter(lambda x: x["rank"] in [0, 1])
     if augment_swap:
         swapped = standardized.map(
             lambda x: {
@@ -100,6 +208,51 @@ def standardize_preference_dataset(ds: Dataset, augment_swap: bool, seed: int) -
         )
         standardized = concatenate_datasets([standardized, swapped]).shuffle(seed=seed)
     return standardized
+
+
+def _looks_like_scored_single_response_dataset(ds: Dataset) -> bool:
+    cols = set(ds.column_names)
+    score_cols = {"helpfulness", "correctness", "coherence", "complexity", "verbosity", "score"}
+    return {"prompt", "response"}.issubset(cols) and len(cols.intersection(score_cols)) > 0
+
+
+def build_pairwise_from_scored_responses(ds: Dataset) -> Dataset:
+    rows_by_prompt: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in ds:
+        rows_by_prompt[row["prompt"]].append(row)
+
+    score_cols = ["helpfulness", "correctness", "coherence", "complexity", "verbosity", "score"]
+    pairs: list[dict[str, Any]] = []
+    for prompt, rows in rows_by_prompt.items():
+        if len(rows) < 2:
+            continue
+
+        def composite_score(r: dict[str, Any]) -> float:
+            vals = []
+            for c in score_cols:
+                v = r.get(c, None)
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+            if len(vals) == 0:
+                return float("-inf")
+            return sum(vals) / len(vals)
+
+        best = max(rows, key=composite_score)
+        worst = min(rows, key=composite_score)
+        if best.get("response") == worst.get("response"):
+            continue
+        pairs.append(
+            {
+                "prompt": prompt,
+                "a1": best["response"],
+                "a2": worst["response"],
+                "rank": 1,
+            }
+        )
+
+    if len(pairs) == 0:
+        raise ValueError("Failed to build pairwise data from scored dataset.")
+    return Dataset.from_list(pairs)
 
 
 def _normalize_weights(weights: list[float]) -> list[float]:
@@ -119,9 +272,24 @@ def load_and_standardize_single_dataset(
     seed: int,
 ) -> Dataset:
     if dataset_config_name:
-        raw = load_dataset(dataset_name, dataset_config_name, split=dataset_split)
+        try:
+            raw = load_dataset(dataset_name, dataset_config_name, split=dataset_split)
+        except ValueError as e:
+            # Some datasets expose only "default" config in specific mirrors/versions.
+            # Fallback to default config to keep mixed training robust.
+            if "BuilderConfig" in str(e) and "not found" in str(e):
+                print(
+                    f"[DRPO] dataset_config_name='{dataset_config_name}' not found for {dataset_name}. "
+                    "Falling back to default config."
+                )
+                raw = load_dataset(dataset_name, split=dataset_split)
+            else:
+                raise
     else:
         raw = load_dataset(dataset_name, split=dataset_split)
+    if _looks_like_scored_single_response_dataset(raw):
+        print(f"[DRPO] Detected scored single-response schema for {dataset_name}; converting to pairwise.")
+        raw = build_pairwise_from_scored_responses(raw)
     return standardize_preference_dataset(raw, augment_swap=augment_swap, seed=seed)
 
 

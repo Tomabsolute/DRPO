@@ -674,10 +674,22 @@ class DRPOTrainer(Trainer):
         # There is 1 offset, because the model predict the next token
         logits = output.logits[:, max(0, prompt_ids.size(1) - 1) : -1]
         logits /= temperature + 1e-7
+
+        # Robustly align lengths in extreme truncation cases (e.g., prompt fully truncated).
+        target_len = logits.size(1)
+        if completion_ids.size(1) != target_len:
+            completion_ids = completion_ids[:, -target_len:]
+            completion_attention_mask = completion_attention_mask[:, -target_len:]
         # Take the completion tokens logp
         logps = selective_log_softmax(logits, completion_ids)
         # logps = torch.take_along_dim(logits.log_softmax(dim=-1), completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
         return logps
+
+    @staticmethod
+    def _tail_align_2d(x: torch.Tensor, target_len: int) -> torch.Tensor:
+        if x.size(1) == target_len:
+            return x
+        return x[:, -target_len:]
     
     # DRPO 的核心训练逻辑：计算 loss、记录 stats、backward。
     def training_step(self, model:nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int]=None) -> torch.Tensor:
@@ -750,16 +762,29 @@ class DRPOTrainer(Trainer):
             
             del (prompt_a2_ids, prompt_a2_attention_mask)
 
-            # compute kl divergence
-            kl_onpolicy_part = ((torch.exp(per_token_ref_logps_star - per_token_logps_star) - (per_token_ref_logps_star - per_token_logps_star) - 1)*astar_attention_mask).sum(-1)
+            # compute kl divergence (tail-aligned for safety under truncation)
+            kl_len = min(
+                per_token_ref_logps_star.size(1),
+                per_token_logps_star.size(1),
+                astar_attention_mask.size(1),
+            )
+            ref_star_aligned = self._tail_align_2d(per_token_ref_logps_star, kl_len)
+            star_aligned = self._tail_align_2d(per_token_logps_star, kl_len)
+            astar_mask_aligned = self._tail_align_2d(astar_attention_mask, kl_len)
+            kl_onpolicy_part = (
+                (torch.exp(ref_star_aligned - star_aligned) - (ref_star_aligned - star_aligned) - 1)
+                * astar_mask_aligned
+            ).sum(-1)
             mean_kl = kl_onpolicy_part.mean()
             if not args.loss1_only:
-                logps_star = (per_token_logps_star * astar_attention_mask).sum(-1)
+                logps_star = (star_aligned * astar_mask_aligned).sum(-1)
                 loss2 = -(logps_star * preference_score_star.clone().detach()).mean()
                 
             if not args.loss2_only:
-                logps = (per_token_logps * a1_attention_mask).sum(1)
-                ref_logps = (per_token_ref_logps * a1_attention_mask).sum(1)
+                a1_len = min(per_token_logps.size(1), per_token_ref_logps.size(1), a1_attention_mask.size(1))
+                a1_mask_aligned = self._tail_align_2d(a1_attention_mask, a1_len)
+                logps = (self._tail_align_2d(per_token_logps, a1_len) * a1_mask_aligned).sum(1)
+                ref_logps = (self._tail_align_2d(per_token_ref_logps, a1_len) * a1_mask_aligned).sum(1)
 
                 ratio = torch.exp(logps - ref_logps)
                 clipped_ratio = torch.clamp(ratio, min = 1. / self.args.clipbound, max = self.args.clipbound)
@@ -855,15 +880,29 @@ class DRPOTrainer(Trainer):
             # Compute the loss part two
             assert per_token_logps_star.size(0) == batch_size * self.args.num_astar
         
-            logps_star = (per_token_logps_star * astar_attention_mask).sum(-1)
+            kl_len = min(
+                per_token_ref_logps_star.size(1),
+                per_token_logps_star.size(1),
+                astar_attention_mask.size(1),
+            )
+            ref_star_aligned = self._tail_align_2d(per_token_ref_logps_star, kl_len)
+            star_aligned = self._tail_align_2d(per_token_logps_star, kl_len)
+            astar_mask_aligned = self._tail_align_2d(astar_attention_mask, kl_len)
+
+            logps_star = (star_aligned * astar_mask_aligned).sum(-1)
             loss2 = -(logps_star * (preference_score_star.clone().detach() - 0.5 * torch.ones_like(logps_star))).mean()
 
-            kl_onpolicy_part = ((torch.exp(per_token_ref_logps_star - per_token_logps_star) - (per_token_ref_logps_star - per_token_logps_star) - 1)*astar_attention_mask).sum(-1)
+            kl_onpolicy_part = (
+                (torch.exp(ref_star_aligned - star_aligned) - (ref_star_aligned - star_aligned) - 1)
+                * astar_mask_aligned
+            ).sum(-1)
             mean_kl = kl_onpolicy_part.mean()
 
             # Compute the loss part one
-            logps = (per_token_logps * a1_attention_mask).sum(1)
-            ref_logps = (per_token_ref_logps * a1_attention_mask).sum(1)
+            a1_len = min(per_token_logps.size(1), per_token_ref_logps.size(1), a1_attention_mask.size(1))
+            a1_mask_aligned = self._tail_align_2d(a1_attention_mask, a1_len)
+            logps = (self._tail_align_2d(per_token_logps, a1_len) * a1_mask_aligned).sum(1)
+            ref_logps = (self._tail_align_2d(per_token_ref_logps, a1_len) * a1_mask_aligned).sum(1)
             
             if args.ratio_processing == "clip":
                 ratio = torch.exp(logps - ref_logps)
@@ -909,7 +948,7 @@ class DRPOTrainer(Trainer):
                 self.accelerator.gather_for_metrics(logps_star).mean().item()
             )
 
-            local_logps_astar_ref = (per_token_ref_logps_star * astar_attention_mask).sum(-1).mean()
+            local_logps_astar_ref = (ref_star_aligned * astar_mask_aligned).sum(-1).mean()
             gathered_logps_astar_ref = self.accelerator.gather_for_metrics(local_logps_astar_ref.unsqueeze(0))
             self.stats['logps/a*_ref'].append(gathered_logps_astar_ref.mean().item())
 

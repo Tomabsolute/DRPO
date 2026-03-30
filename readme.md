@@ -74,3 +74,13 @@ python compare_hh_outputs.py \
 ```
 
 `accelerate launch -m examples.general.drpo --config examples/general/config.yaml`
+
+```
+accelerate launch -m examples.general.drpo \
+  --config examples/general/config.yaml \
+  2>&1 | tee train.log
+
+tail -n 100 train.log
+
+grep -i error train.log
+```
