@@ -470,7 +470,7 @@ class BTRewardNetwork(nn.Module):
     def __init__(self, 
     model_name_or_path: str, 
     revision: str = "main", 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), 
+    device: Optional[torch.device] = None,
     pad_token_id: Optional[int]=None, 
     eos_token_id: Optional[int]=151645,
     truncation: bool = True,
@@ -478,6 +478,9 @@ class BTRewardNetwork(nn.Module):
     max_length: int = 4096,
     ):
         super().__init__()
+        if device is None:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
         self.rm = AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path,
             revision=revision,

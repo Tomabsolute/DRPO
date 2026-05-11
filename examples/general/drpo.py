@@ -15,6 +15,8 @@ from trl import (
 )
 from trl.experimental.utils import SIMPLE_CHAT_TEMPLATE
 
+from trainer import BTRewardNetwork, DRPOConfig, DRPOTrainer, GPMwithRewardNetwork, estDPOStylePipeline
+
 
 def _messages_to_text(messages: Any) -> str:
     if not isinstance(messages, list):
@@ -40,17 +42,6 @@ def _to_plain_text(x: Any) -> str:
         content = str(x.get("content", ""))
         return f"{role}: {content}".strip()
     return str(x)
-
-
-def load_drpo_modules(trainer_variant: str):
-    variant = (trainer_variant or "no_clip").lower()
-    if variant in {"clip", "trainer"}:
-        from trainer import BTRewardNetwork, DRPOConfig, DRPOTrainer, GPMwithRewardNetwork, estDPOStylePipeline
-    elif variant in {"no_clip", "trainer_2"}:
-        from trainer_2 import BTRewardNetwork, DRPOConfig, DRPOTrainer, GPMwithRewardNetwork, estDPOStylePipeline
-    else:
-        raise ValueError(f"Unsupported trainer_variant: {trainer_variant}. Use clip|no_clip.")
-    return DRPOConfig, DRPOTrainer, GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork
 
 
 def convert_example_to_drpo_schema(example: dict[str, Any]) -> dict[str, Any]:
@@ -324,7 +315,7 @@ def load_train_dataset_from_mix(script_cfg: dict[str, Any], augment_swap: bool, 
     return mixed
 
 
-def main(config_path: str):
+def main(config_path: str, resume_from_checkpoint: str | None = None):
     with open(config_path, "r") as f:
         raw_cfg = yaml.safe_load(f)
 
@@ -332,11 +323,6 @@ def main(config_path: str):
     script_cfg = raw_cfg.pop("script_args", {}) or {}
     model_cfg = raw_cfg.pop("model_args", {}) or {}
     training_args_cfg = raw_cfg
-
-    trainer_variant = runtime_cfg.get("trainer_variant", "no_clip")
-    DRPOConfig, DRPOTrainer, GPMwithRewardNetwork, estDPOStylePipeline, BTRewardNetwork = load_drpo_modules(
-        trainer_variant
-    )
 
     fallback_dataset_name = script_cfg.get("dataset_name")
     if not fallback_dataset_name and script_cfg.get("dataset_mix"):
@@ -373,14 +359,17 @@ def main(config_path: str):
         **model_kwargs,
     )
     peft_config = get_peft_config(model_args)
-    if peft_config is None:
-        ref_model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            trust_remote_code=model_args.trust_remote_code,
-            **model_kwargs,
-        )
-    else:
-        ref_model = None
+    if peft_config is not None:
+        from peft import get_peft_model
+        model = get_peft_model(model, peft_config)
+        if hasattr(model, "print_trainable_parameters"):
+            model.print_trainable_parameters()
+    # DRPO trainer requires an explicit reference model in all branches.
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code,
+        **model_kwargs,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -462,7 +451,11 @@ def main(config_path: str):
         processing_class=tokenizer,
         args=training_args,
     )
-    trainer.train()
+    resume_ckpt = resume_from_checkpoint or runtime_cfg.get("resume_from_checkpoint")
+    if resume_ckpt is None:
+        trainer.train()
+    else:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
 
     trainer.save_model(training_args.output_dir)
     if training_args.push_to_hub:
@@ -472,5 +465,6 @@ def main(config_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="examples/general/config.yaml")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, resume_from_checkpoint=args.resume_from_checkpoint)

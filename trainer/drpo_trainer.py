@@ -351,6 +351,8 @@ class DRPOTrainer(Trainer):
             optimizers: Optional[Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]] = (None, None)
         ) -> None:
         
+        if ref_model is None:
+            raise ValueError("The reference model cannot be None.")
         if ref_model is model:
             raise ValueError("The reference model cannot be the same as the model.")         
         self.ref_model = ref_model
@@ -446,7 +448,10 @@ class DRPOTrainer(Trainer):
             self.stats["ps/a1"] = []
             self.stats["is_ratio"] = []
             if args.ratio_processing == "clip":
-                self.stats["clipped_correction"] = []
+                if args.clip_mode == "new":
+                    self.stats["clipped_correction"] = []
+                else:
+                    self.stats["clipped_ratio"] = []
         if not args.loss1_only:
             self.stats["logps/a*"] = []
             self.stats["logps/a*_ref"] = []
@@ -580,7 +585,6 @@ class DRPOTrainer(Trainer):
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
@@ -701,6 +705,8 @@ class DRPOTrainer(Trainer):
     def training_step(self, model:nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int]=None) -> torch.Tensor:
         model.train()
         args = self.args
+        clipped_correction = None
+        clipped_ratio = None
 
         if args.model_and_preference_share_basemodel:
             # then we don't need to decode and re-tokenize the generated samples to feed in preference model
@@ -777,33 +783,66 @@ class DRPOTrainer(Trainer):
             ref_star_aligned = self._tail_align_2d(per_token_ref_logps_star, kl_len)
             star_aligned = self._tail_align_2d(per_token_logps_star, kl_len)
             astar_mask_aligned = self._tail_align_2d(astar_attention_mask, kl_len)
+            star_mask = astar_mask_aligned.to(star_aligned.dtype)
+            valid_star_token_count = star_mask.sum(-1).clamp_min(1.0)
             kl_onpolicy_part = (
                 (torch.exp(ref_star_aligned - star_aligned) - (ref_star_aligned - star_aligned) - 1)
-                * astar_mask_aligned
-            ).sum(-1)
+                * star_mask
+            ).sum(-1) / valid_star_token_count
             mean_kl = kl_onpolicy_part.mean()
             if not args.loss1_only:
-                logps_star = (star_aligned * astar_mask_aligned).sum(-1)
-                loss2 = -(logps_star * preference_score_star.clone().detach()).mean()
+                logps_star = (star_aligned * star_mask).sum(-1) / valid_star_token_count
+                loss2_token = -star_aligned * preference_score_star.clone().detach().unsqueeze(1)
+                loss2 = ((loss2_token * star_mask).sum(-1) / valid_star_token_count).mean()
                 
             if not args.loss2_only:
                 a1_len = min(per_token_logps.size(1), per_token_ref_logps.size(1), a1_attention_mask.size(1))
                 a1_mask_aligned = self._tail_align_2d(a1_attention_mask, a1_len)
-                logps = (self._tail_align_2d(per_token_logps, a1_len) * a1_mask_aligned).sum(1)
-                ref_logps = (self._tail_align_2d(per_token_ref_logps, a1_len) * a1_mask_aligned).sum(1)
+                token_mask = a1_mask_aligned.to(per_token_logps.dtype)
+                valid_token_count = token_mask.sum(1).clamp_min(1.0)
+                token_logps = self._tail_align_2d(per_token_logps, a1_len)
+                token_ref_logps = self._tail_align_2d(per_token_ref_logps, a1_len)
+                logps = (token_logps * token_mask).sum(1) / valid_token_count
+                ref_logps = (token_ref_logps * token_mask).sum(1) / valid_token_count
 
-                ratio = torch.exp(logps - ref_logps)
-                is_term = -ratio.detach() * rank.detach() * logps
-                correction_term = -ratio.detach() * preference_score.clone().detach() * logps
-                losses1 = is_term - correction_term
-
+                token_ratio = torch.exp(token_logps - token_ref_logps)
                 if args.ratio_processing == "clip" and (not args.loss1_only):
-                    is_value = is_term.mean()
-                    correction_value = correction_term.mean()
-                    dm_value = loss2.detach()
-                    clipped_correction = self._clip_between(correction_value, is_value.detach(), dm_value)
-                    loss1_value = is_value - clipped_correction
+                    # Clip each token-level ratio first, then reduce to per-sample mean ratio.
+                    clipped_token_ratio = torch.clamp(
+                        token_ratio,
+                        min=1.0 / self.args.clipbound,
+                        max=self.args.clipbound,
+                    )
+                    clipped_ratio = (clipped_token_ratio * token_mask).sum(1) / valid_token_count
+                    ratio = clipped_ratio
+                    is_term_token = -clipped_token_ratio.detach() * rank.detach().unsqueeze(1) * token_logps
+                    correction_term_token = (
+                        -clipped_token_ratio.detach()
+                        * preference_score.clone().detach().unsqueeze(1)
+                        * token_logps
+                    )
+                    is_term = (is_term_token * token_mask).sum(1) / valid_token_count
+                    correction_term = (correction_term_token * token_mask).sum(1) / valid_token_count
+                    if args.clip_mode == "orig":
+                        losses1 = is_term - correction_term
+                        loss1_value = losses1.mean()
+                    else:
+                        is_value = is_term.mean()
+                        correction_value = correction_term.mean()
+                        dm_value = loss2.detach()
+                        clipped_correction = self._clip_between(correction_value, is_value.detach(), dm_value)
+                        loss1_value = is_value - clipped_correction
                 else:
+                    ratio = (token_ratio * token_mask).sum(1) / valid_token_count
+                    is_term_token = -token_ratio.detach() * rank.detach().unsqueeze(1) * token_logps
+                    correction_term_token = (
+                        -token_ratio.detach()
+                        * preference_score.clone().detach().unsqueeze(1)
+                        * token_logps
+                    )
+                    is_term = (is_term_token * token_mask).sum(1) / valid_token_count
+                    correction_term = (correction_term_token * token_mask).sum(1) / valid_token_count
+                    losses1 = is_term - correction_term
                     loss1_value = losses1.mean()
 
             if args.loss1_only:
@@ -852,9 +891,7 @@ class DRPOTrainer(Trainer):
                 prompt_a2_ids = torch.cat((prompt_ids, a2_ids), dim=1)
 
                 prompt_astar = self.processing_class.batch_decode(prompt_astar_ids, skip_special_tokens=True)
-                print("\033[42mprompt_astar:\033[0m", prompt_astar[0])
                 prompt_a2 = self.processing_class.batch_decode(prompt_a2_ids, skip_special_tokens=True)
-                print("\033[43mprompt_a2:\033[0m",prompt_a2[0])
                 prompt_a2_repeated = prompt_a2 * self.args.num_astar
                 assert(len(prompt_astar) == len(prompt_a2_repeated))
                 
@@ -889,8 +926,6 @@ class DRPOTrainer(Trainer):
                 else:
                     raise NotImplementedError("precompute_preference_score is not implemented yet.")
                 
-                print("\033[46mpreference_score_star:\033[0m", preference_score_star[0].item())
-                
                 del prompt_astar_ids, prompt_a2_ids, prompt_astar, prompt_a2, prompt_a2_repeated, prompt_a1_ids, prompt_a1
 
             # Compute the loss part two
@@ -905,40 +940,81 @@ class DRPOTrainer(Trainer):
             star_aligned = self._tail_align_2d(per_token_logps_star, kl_len)
             astar_mask_aligned = self._tail_align_2d(astar_attention_mask, kl_len)
 
-            logps_star = (star_aligned * astar_mask_aligned).sum(-1)
-            loss2 = -(logps_star * (preference_score_star.clone().detach() - 0.5 * torch.ones_like(logps_star))).mean()
+            star_mask = astar_mask_aligned.to(star_aligned.dtype)
+            valid_star_token_count = star_mask.sum(-1).clamp_min(1.0)
+            logps_star = (star_aligned * star_mask).sum(-1) / valid_star_token_count
+            centered_preference = preference_score_star.clone().detach() - 0.5 * torch.ones_like(logps_star)
+            loss2_token = -star_aligned * centered_preference.unsqueeze(1)
+            loss2 = ((loss2_token * star_mask).sum(-1) / valid_star_token_count).mean()
 
             kl_onpolicy_part = (
                 (torch.exp(ref_star_aligned - star_aligned) - (ref_star_aligned - star_aligned) - 1)
-                * astar_mask_aligned
-            ).sum(-1)
+                * star_mask
+            ).sum(-1) / valid_star_token_count
             mean_kl = kl_onpolicy_part.mean()
 
             # Compute the loss part one
             a1_len = min(per_token_logps.size(1), per_token_ref_logps.size(1), a1_attention_mask.size(1))
             a1_mask_aligned = self._tail_align_2d(a1_attention_mask, a1_len)
-            logps = (self._tail_align_2d(per_token_logps, a1_len) * a1_mask_aligned).sum(1)
-            ref_logps = (self._tail_align_2d(per_token_ref_logps, a1_len) * a1_mask_aligned).sum(1)
+            token_mask = a1_mask_aligned.to(per_token_logps.dtype)
+            valid_token_count = token_mask.sum(1).clamp_min(1.0)
+            token_logps = self._tail_align_2d(per_token_logps, a1_len)
+            token_ref_logps = self._tail_align_2d(per_token_ref_logps, a1_len)
+            logps = (token_logps * token_mask).sum(1) / valid_token_count
+            ref_logps = (token_ref_logps * token_mask).sum(1) / valid_token_count
             
             if args.ratio_processing == "self_normalize":
-                ratio_nominator = torch.exp(logps) / torch.exp(logps).mean()
-                ratio_denominator = torch.exp(ref_logps) / torch.exp(ref_logps).mean()
-                ratio = ratio_nominator / ratio_denominator
+                token_ratio_nominator = torch.exp(token_logps)
+                token_ratio_denominator = torch.exp(token_ref_logps)
+                token_ratio_nominator = token_ratio_nominator / (
+                    (token_ratio_nominator * token_mask).sum(1, keepdim=True) / valid_token_count.unsqueeze(1)
+                ).clamp_min(1e-8)
+                token_ratio_denominator = token_ratio_denominator / (
+                    (token_ratio_denominator * token_mask).sum(1, keepdim=True) / valid_token_count.unsqueeze(1)
+                ).clamp_min(1e-8)
+                token_ratio = token_ratio_nominator / token_ratio_denominator
+                ratio = (token_ratio * token_mask).sum(1) / valid_token_count
 
             else:
-                ratio = torch.exp(logps - ref_logps)
-
-            is_term = -ratio.detach() * rank.detach() * logps
-            correction_term = -ratio.detach() * preference_score.clone().detach() * logps
-            losses1 = is_term - correction_term
+                token_ratio = torch.exp(token_logps - token_ref_logps)
+                ratio = (token_ratio * token_mask).sum(1) / valid_token_count
 
             if args.ratio_processing == "clip" and (not args.loss1_only):
-                is_value = is_term.mean()
-                correction_value = correction_term.mean()
-                dm_value = loss2.detach()
-                clipped_correction = self._clip_between(correction_value, is_value.detach(), dm_value)
-                loss1_value = is_value - clipped_correction
+                # Clip each token-level ratio first, then reduce to per-sample mean ratio.
+                clipped_token_ratio = torch.clamp(
+                    token_ratio,
+                    min=1.0 / self.args.clipbound,
+                    max=self.args.clipbound,
+                )
+                clipped_ratio = (clipped_token_ratio * token_mask).sum(1) / valid_token_count
+                ratio = clipped_ratio
+                is_term_token = -clipped_token_ratio.detach() * rank.detach().unsqueeze(1) * token_logps
+                correction_term_token = (
+                    -clipped_token_ratio.detach()
+                    * preference_score.clone().detach().unsqueeze(1)
+                    * token_logps
+                )
+                is_term = (is_term_token * token_mask).sum(1) / valid_token_count
+                correction_term = (correction_term_token * token_mask).sum(1) / valid_token_count
+                if args.clip_mode == "orig":
+                    losses1 = is_term - correction_term
+                    loss1_value = losses1.mean()
+                else:
+                    is_value = is_term.mean()
+                    correction_value = correction_term.mean()
+                    dm_value = loss2.detach()
+                    clipped_correction = self._clip_between(correction_value, is_value.detach(), dm_value)
+                    loss1_value = is_value - clipped_correction
             else:
+                is_term_token = -token_ratio.detach() * rank.detach().unsqueeze(1) * token_logps
+                correction_term_token = (
+                    -token_ratio.detach()
+                    * preference_score.clone().detach().unsqueeze(1)
+                    * token_logps
+                )
+                is_term = (is_term_token * token_mask).sum(1) / valid_token_count
+                correction_term = (correction_term_token * token_mask).sum(1) / valid_token_count
+                losses1 = is_term - correction_term
                 loss1_value = losses1.mean()
             
             if args.loss2_only:
@@ -959,7 +1035,14 @@ class DRPOTrainer(Trainer):
             self.stats['ps/a1'].append(self.accelerator.gather_for_metrics(preference_score).mean().item()) # preference score
             self.stats['is_ratio'].append(self.accelerator.gather_for_metrics(ratio.mean()).mean().item())
             if self.args.ratio_processing == "clip" and (not self.args.loss1_only):
-                self.stats['clipped_correction'].append(self.accelerator.gather_for_metrics(clipped_correction).mean().item())
+                if self.args.clip_mode == "new" and clipped_correction is not None:
+                    self.stats['clipped_correction'].append(
+                        self.accelerator.gather_for_metrics(clipped_correction).mean().item()
+                    )
+                if self.args.clip_mode == "orig" and clipped_ratio is not None:
+                    self.stats['clipped_ratio'].append(
+                        self.accelerator.gather_for_metrics(clipped_ratio.mean()).mean().item()
+                    )
         if not self.args.loss1_only:
             self.stats['objective/loss2'].append(
                 self.accelerator.gather_for_metrics(loss2).mean().item()
@@ -968,7 +1051,7 @@ class DRPOTrainer(Trainer):
                 self.accelerator.gather_for_metrics(logps_star).mean().item()
             )
 
-            local_logps_astar_ref = (ref_star_aligned * astar_mask_aligned).sum(-1).mean()
+            local_logps_astar_ref = ((ref_star_aligned * star_mask).sum(-1) / valid_star_token_count).mean()
             gathered_logps_astar_ref = self.accelerator.gather_for_metrics(local_logps_astar_ref.unsqueeze(0))
             self.stats['logps/a*_ref'].append(gathered_logps_astar_ref.mean().item())
 

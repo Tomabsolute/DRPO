@@ -187,6 +187,14 @@ class DRPOConfig(TrainingArguments):
         metadata={"help": "Deprecated by Clip-DRPO correction clipping; kept for backward compatibility."},
     )
 
+    # clip 路径选择:
+    # new  -> Clip-DRPO correction clipping (当前 trainer 实现)
+    # orig -> 原版 ratio clamp: clamp(r, 1/clipbound, clipbound)
+    clip_mode: str = field(
+        default="new",
+        metadata={"help": "Clip mode when ratio_processing='clip'. Choose from: 'new' or 'orig'."},
+    )
+
     # 控制参考模型前向传递的温度
     forward_temperature: Optional[float] = field(
         default=0.9,
@@ -216,4 +224,5 @@ class DRPOConfig(TrainingArguments):
         super().__post_init__()
         if hasattr(self.beta, "__len__") and len(self.beta) == 1:
             self.beta = self.beta[0]
-
+        if self.clip_mode not in {"new", "orig"}:
+            raise ValueError(f"clip_mode must be one of ['new', 'orig'], got: {self.clip_mode}")

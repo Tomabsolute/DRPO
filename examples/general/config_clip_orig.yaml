@@ -1,0 +1,85 @@
+runtime:
+  augment_swap: false
+  seed: 996
+  policy_padding_side: left
+  # used only when dataset_mix is set and eval_strategy != "no"
+  eval_size: 0.02
+
+script_args:
+  dataset_train_split: "train"
+  dataset_test_split: "test"
+  # Use tiny slices for smoke test to validate pipeline end-to-end.
+  dataset_mix:
+    - dataset_name: "./dataset/ultrafeedback_binarized"
+      split: "train_prefs"
+      weight: 0.7
+    - dataset_name: "./dataset/HelpSteer2"
+      split: "train"
+      weight: 0.2
+    - dataset_name: "./dataset/distilabel-intel-orca-dpo-pairs"
+      split: "train"
+      weight: 0.1
+  mix_stopping_strategy: "first_exhausted"
+
+model_args:
+  # Smaller base model for local bring-up
+  model_name_or_path: "./model/Llama-3.1-8B-Instruct"
+  attn_implementation: "sdpa"
+  use_peft: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: "all-linear"
+
+output_dir: ./output/general_clip_orig/
+
+gradient_checkpointing: true
+model_and_preference_share_basemodel: false
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 4.0e-7
+optim: adafactor
+
+max_length: 768
+max_new_tokens: 48
+max_prompt_length: 512
+max_completion_length: 192
+generate_temperature: 0.8
+forward_temperature: 0.8
+beta: 0.12
+
+bf16: true
+tf32: true
+dataset_num_proc: 16
+num_astar: 2
+torch_empty_cache_steps: null
+num_train_epochs: 1
+dataloader_num_workers: 8
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4
+ddp_find_unused_parameters: false
+
+eval_steps: 50
+eval_strategy: "no"
+save_strategy: "steps"
+save_steps: 50
+logging_steps: 1
+push_to_hub: false
+
+is_bt_model: true
+preference_model_id: "./model/Skywork-Reward-V2-Qwen3-4B"
+preference_model_revision: "main"
+preference_model_kwargs:
+  indifferent: false
+  random: false
+  reverse: false
+
+ratio_processing: clip
+clipbound: 2.5
+clip_mode: orig
+max_grad_norm: 0.2
+
+loss1_only: false
+loss2_only: false

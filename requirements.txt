@@ -44,14 +44,14 @@ scipy==1.15.3
 sentencepiece==0.2.1
 shellingham==1.5.4
 six==1.17.0
-sympy==1.13.1
+sympy
 tokenizers==0.22.1
 torch==2.10.0
 torchaudio==2.10.0
 torchvision==0.25.0
 tqdm==4.67.2
 transformers==5.0.0
-triton==3.1.0
+triton
 trl==0.27.1
 typer-slim==0.21.1
 typing-extensions==4.15.0
